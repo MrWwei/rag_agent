@@ -1,6 +1,6 @@
 """
 医疗问答系统
-结合RAG检索和大模型，提供专业的医疗问答服务
+结合RAG检索、大模型和智能体，提供专业的医疗问答服务
 """
 
 import os
@@ -8,15 +8,17 @@ import json
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 from src.rag_retriever import MedicalRAGRetriever
+from src.medical_agent import MedicalAgent
 
 
 class MedicalQASystem:
-    """医疗问答系统"""
+    """医疗问答系统 - 支持RAG、LLM和Agent三种模式"""
     
     def __init__(self, 
                  vector_store_path: str = "./vector_store",
                  model: str = "qwen-plus",
                  max_context_length: int = 4000,
+                 mode: str = "rag",
                  enable_rag: bool = True):
         """
         初始化医疗问答系统
@@ -25,32 +27,57 @@ class MedicalQASystem:
             vector_store_path: 向量存储路径
             model: 使用的大模型名称
             max_context_length: 最大上下文长度
-            enable_rag: 是否启用RAG检索，False则使用纯大模型模式
+            mode: 工作模式 ("rag", "llm", "agent")
+            enable_rag: 是否启用RAG检索（仅在rag和agent模式中生效）
         """
         self.vector_store_path = vector_store_path
         self.model = model
         self.max_context_length = max_context_length
-        self.enable_rag = enable_rag
+        self.mode = mode.lower()
+        self.enable_rag = enable_rag and (self.mode in ["rag", "agent"])
         
-        # 根据RAG开关决定是否初始化RAG检索器
-        if self.enable_rag:
-            self.retriever = MedicalRAGRetriever(vector_store_path)
+        # 验证模式
+        valid_modes = ["rag", "llm", "agent"]
+        if self.mode not in valid_modes:
+            raise ValueError(f"无效的模式: {self.mode}。支持的模式: {valid_modes}")
+        
+        # 根据模式初始化相应组件
+        if self.mode == "agent":
+            # 智能体模式
+            self.agent = MedicalAgent(
+                vector_store_path=vector_store_path,
+                model=model,
+                enable_rag=self.enable_rag
+            )
+            self.retriever = self.agent.retriever if self.enable_rag else None
+            self.client = self.agent.client
         else:
-            self.retriever = None
-            print("🔄 RAG检索已关闭，使用纯大模型模式")
-        
-        # 初始化大模型客户端
-        self.client = OpenAI(
-            api_key=os.getenv("DASHSCOPE_API_KEY"),
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        )
+            # RAG或LLM模式
+            self.agent = None
+            
+            # 根据RAG开关决定是否初始化RAG检索器
+            if self.enable_rag:
+                self.retriever = MedicalRAGRetriever(vector_store_path)
+            else:
+                self.retriever = None
+                print("🔄 RAG检索已关闭，使用纯大模型模式")
+            
+            # 初始化大模型客户端
+            self.client = OpenAI(
+                api_key=os.getenv("DASHSCOPE_API_KEY"),
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
         
         # 系统提示词
         self.system_prompt = self._build_system_prompt()
     
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
-        if self.enable_rag:
+        if self.mode == "agent":
+            # 智能体模式使用简化的提示词，因为主要逻辑在agent中
+            return """你是一位专业的医疗智能助手，具有工具调用和推理能力。
+请基于提供的信息回答用户问题，并始终提醒用户咨询专业医生。"""
+        elif self.enable_rag:
             return """你是一位专业的医疗知识问答助手。请遵循以下原则：
 
 1. **专业性**：基于提供的医疗知识库内容回答问题，确保信息准确性
@@ -178,10 +205,52 @@ class MedicalQASystem:
         Returns:
             包含答案和相关信息的字典
         """
-        mode = "RAG增强模式" if self.enable_rag else "纯大模型模式"
-        print(f"\n=== 医疗问答系统 ({mode}) ===")
+        mode_name = f"{self.mode.upper()}模式" + ("(RAG增强)" if self.enable_rag else "")
+        print(f"\n=== 医疗问答系统 ({mode_name}) ===")
         print(f"问题: {question}")
         
+        if self.mode == "agent":
+            # 智能体模式
+            return self._answer_with_agent(question)
+        else:
+            # RAG或LLM模式
+            return self._answer_with_rag_or_llm(question, k, show_context)
+    
+    def _answer_with_agent(self, question: str) -> Dict[str, Any]:
+        """使用智能体模式回答问题"""
+        try:
+            agent_result = self.agent.chat(question)
+            
+            return {
+                'question': question,
+                'answer': agent_result['response'],
+                'search_results': [],
+                'retrieval_success': False,
+                'sources': [],
+                'context': None,
+                'mode': f"Agent模式{'(RAG增强)' if self.enable_rag else ''}",
+                'rag_enabled': self.enable_rag,
+                'agent_info': {
+                    'tool_calls': agent_result.get('tool_calls', []),
+                    'iterations': agent_result.get('iterations', 0),
+                    'tools_used': [tc['tool_call']['tool_name'] for tc in agent_result.get('tool_calls', [])]
+                }
+            }
+        except Exception as e:
+            return {
+                'question': question,
+                'answer': f"智能体处理过程中出现错误: {str(e)}",
+                'search_results': [],
+                'retrieval_success': False,
+                'sources': [],
+                'context': None,
+                'mode': f"Agent模式{'(RAG增强)' if self.enable_rag else ''}",
+                'rag_enabled': self.enable_rag,
+                'error': str(e)
+            }
+    
+    def _answer_with_rag_or_llm(self, question: str, k: int, show_context: bool) -> Dict[str, Any]:
+        """使用RAG或LLM模式回答问题"""
         # 1. 检索相关上下文 (如果启用RAG)
         context, search_results = self.retrieve_context(question, k)
         
@@ -189,6 +258,7 @@ class MedicalQASystem:
         answer = self.generate_answer(question, context)
         
         # 3. 组织结果
+        mode_name = "RAG模式" if self.enable_rag else "LLM模式"
         result = {
             'question': question,
             'answer': answer,
@@ -196,7 +266,7 @@ class MedicalQASystem:
             'retrieval_success': len(search_results) > 0,
             'sources': [result['source'] for result in search_results],
             'context': context if show_context else None,
-            'mode': mode,
+            'mode': mode_name,
             'rag_enabled': self.enable_rag
         }
         
@@ -221,12 +291,15 @@ class MedicalQASystem:
     
     def interactive_qa(self):
         """交互式问答模式"""
-        mode = "RAG增强模式" if self.enable_rag else "纯大模型模式"
-        print(f"=== 医疗问答系统 ({mode}) ===")
+        mode_name = f"{self.mode.upper()}模式" + ("(RAG增强)" if self.enable_rag else "")
+        print(f"=== 医疗问答系统 ({mode_name}) ===")
         print("欢迎使用医疗知识问答系统！")
         print("您可以询问关于疾病、症状、治疗、药物等医疗相关问题。")
         print("输入 'quit' 或 'exit' 退出系统。")
-        if self.enable_rag:
+        
+        if self.mode == "agent":
+            print("当前使用智能体模式，具有工具调用和推理能力。")
+        elif self.enable_rag:
             print("当前使用RAG增强模式，基于专业医疗知识库回答。")
         else:
             print("当前使用纯大模型模式，基于模型内置知识回答。")
@@ -235,6 +308,9 @@ class MedicalQASystem:
         if self.enable_rag and (not self.retriever or not self.retriever.vector_store):
             print("错误：向量存储未初始化，请先运行 build_knowledge_base.py 构建知识库")
             return
+        
+        # 智能体模式的对话历史
+        conversation_history = [] if self.mode == "agent" else None
         
         while True:
             try:
@@ -248,27 +324,53 @@ class MedicalQASystem:
                     print("请输入有效的问题。")
                     continue
                 
-                # 回答问题
-                result = self.answer_question(question, k=3)
                 
-                # 显示答案
-                print(f"\n【回答】")
-                print(result['answer'])
-                
-                # 只在RAG模式下显示信息来源和检索结果
-                if self.enable_rag and result['sources']:
-                    print(f"\n【信息来源】")
-                    for i, source in enumerate(set(result['sources']), 1):
-                        print(f"{i}. {source}")
-                
-                    # 显示检索结果的相似度
-                    if result['search_results']:
-                        print(f"\n【检索信息】")
-                        print(f"找到 {len(result['search_results'])} 个相关文档")
-                        for i, res in enumerate(result['search_results'], 1):
-                            print(f"{i}. {res['source']} (相似度: {res['similarity_score']:.3f})")
-                elif not self.enable_rag:
-                    print(f"\n【信息来源】大模型内置知识")
+                # 根据模式回答问题
+                if self.mode == "agent":
+                    # 智能体模式，支持多轮对话
+                    agent_result = self.agent.chat(question, conversation_history)
+                    
+                    print(f"\n【智能体回答】")
+                    print(agent_result['response'])
+                    
+                    # 显示工具使用信息
+                    if agent_result.get('tool_calls'):
+                        print(f"\n【工具使用】")
+                        print(f"使用了 {len(agent_result['tool_calls'])} 个工具:")
+                        for i, tool_call in enumerate(agent_result['tool_calls'], 1):
+                            tool_name = tool_call['tool_call']['tool_name']
+                            reason = tool_call['tool_call'].get('reason', '未说明')
+                            success = tool_call['result'].get('success', False)
+                            status = "✅" if success else "❌"
+                            print(f"  {i}. {tool_name} {status} - {reason}")
+                    
+                    print(f"\n【执行统计】推理迭代: {agent_result['iterations']}次")
+                    
+                    # 更新对话历史
+                    conversation_history = agent_result['conversation_history']
+                    
+                else:
+                    # RAG或LLM模式
+                    result = self.answer_question(question, k=3)
+                    
+                    # 显示答案
+                    print(f"\n【回答】")
+                    print(result['answer'])
+                    
+                    # 只在RAG模式下显示信息来源和检索结果
+                    if self.enable_rag and result['sources']:
+                        print(f"\n【信息来源】")
+                        for i, source in enumerate(set(result['sources']), 1):
+                            print(f"{i}. {source}")
+                    
+                        # 显示检索结果的相似度
+                        if result['search_results']:
+                            print(f"\n【检索信息】")
+                            print(f"找到 {len(result['search_results'])} 个相关文档")
+                            for i, res in enumerate(result['search_results'], 1):
+                                print(f"{i}. {res['source']} (相似度: {res['similarity_score']:.3f})")
+                    elif not self.enable_rag:
+                        print(f"\n【信息来源】大模型内置知识")
                 
                 print("\n" + "-"*50)
                 
@@ -280,11 +382,15 @@ class MedicalQASystem:
     
     def toggle_rag_mode(self, enable_rag: bool = None):
         """
-        切换RAG模式
+        切换RAG模式（仅在rag和llm模式下有效）
         
         Args:
             enable_rag: 是否启用RAG，None则切换当前状态
         """
+        if self.mode == "agent":
+            print("智能体模式的RAG设置在初始化时确定，无法动态切换")
+            return
+        
         if enable_rag is None:
             self.enable_rag = not self.enable_rag
         else:
@@ -301,9 +407,72 @@ class MedicalQASystem:
         # 更新系统提示词
         self.system_prompt = self._build_system_prompt()
     
+    def switch_mode(self, new_mode: str, enable_rag: bool = True):
+        """
+        切换工作模式
+        
+        Args:
+            new_mode: 新模式 ("rag", "llm", "agent")
+            enable_rag: 是否启用RAG（仅对rag和agent模式有效）
+        """
+        valid_modes = ["rag", "llm", "agent"]
+        if new_mode.lower() not in valid_modes:
+            print(f"❌ 无效的模式: {new_mode}。支持的模式: {valid_modes}")
+            return
+        
+        old_mode = self.mode
+        self.mode = new_mode.lower()
+        self.enable_rag = enable_rag and (self.mode in ["rag", "agent"])
+        
+        # 重新初始化组件
+        if self.mode == "agent":
+            print("🤖 切换到智能体模式...")
+            self.agent = MedicalAgent(
+                vector_store_path=self.vector_store_path,
+                model=self.model,
+                enable_rag=self.enable_rag
+            )
+            self.retriever = self.agent.retriever if self.enable_rag else None
+            self.client = self.agent.client
+        else:
+            print(f"🔄 切换到{self.mode.upper()}模式...")
+            self.agent = None
+            
+            if self.enable_rag:
+                if not self.retriever:
+                    self.retriever = MedicalRAGRetriever(self.vector_store_path)
+            else:
+                self.retriever = None
+        
+        # 更新系统提示词
+        self.system_prompt = self._build_system_prompt()
+        
+        mode_name = f"{self.mode.upper()}模式" + ("(RAG增强)" if self.enable_rag else "")
+        print(f"✅ 已从{old_mode.upper()}模式切换到{mode_name}")
+    
     def get_current_mode(self) -> str:
         """获取当前模式状态"""
-        return "RAG增强模式" if self.enable_rag else "纯大模型模式"
+        return f"{self.mode.upper()}模式" + ("(RAG增强)" if self.enable_rag else "")
+    
+    def get_capabilities(self) -> Dict[str, Any]:
+        """获取当前模式的能力描述"""
+        if self.mode == "agent":
+            return self.agent.get_capabilities()
+        else:
+            return {
+                "mode": self.get_current_mode(),
+                "capabilities": [
+                    "医疗问答",
+                    "文档检索" if self.enable_rag else "知识问答",
+                    "批量处理",
+                    "质量评估"
+                ],
+                "limitations": [
+                    "不提供具体医疗诊断",
+                    "不能替代专业医疗咨询",
+                    "建议结果仅供参考"
+                ]
+            }
     
     def evaluate_answer_quality(self, question: str, answer: str, search_results: List[Dict]) -> Dict[str, Any]:
         """

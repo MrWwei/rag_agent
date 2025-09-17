@@ -10,3 +10,8 @@ pandas==2.0.3
 python-dotenv==1.0.0
 jupyter==1.0.0
 openai>=1.0.0
+
+# 智能体相关依赖
+regex>=2023.0.0
+colorama>=0.4.6
+rich>=13.0.0

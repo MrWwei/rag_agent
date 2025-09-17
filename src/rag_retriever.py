@@ -220,6 +220,31 @@ class MedicalRAGRetriever:
         context = "\n\n---\n\n".join(context_parts)
         return context
     
+    def search_relevant_docs(self, query: str, top_k: int = 3) -> List[str]:
+        """
+        搜索相关文档（为了兼容性）
+        
+        Args:
+            query: 查询文本
+            top_k: 返回的文档数量
+            
+        Returns:
+            相关文档内容列表
+        """
+        results = self.similarity_search(query, k=top_k)
+        
+        if not results:
+            return []
+        
+        # 返回文档内容列表
+        docs = []
+        for result in results:
+            source = result['source'].split('/')[-1] if '/' in result['source'] else result['source']
+            doc_content = f"来源: {source}\n{result['content']}"
+            docs.append(doc_content)
+        
+        return docs
+    
     def analyze_query_embedding(self, query: str) -> Dict[str, Any]:
         """
         分析查询嵌入向量的特征
